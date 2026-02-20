@@ -5,7 +5,7 @@ import os
 
 # Buscando Token do arquivo .env
 load_dotenv()
-TOKEN = os.getenv("TOKEN")
+TOKEN = os.getenv("BOT_TOKEN")
 
 # Criando Função para o comando /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
