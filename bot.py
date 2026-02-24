@@ -11,19 +11,28 @@ from telegram.ext import (
 )
 from pyngrok import ngrok
 from dotenv import load_dotenv
+from datetime import datetime
 import os
 import mercadopago
-from payment import gerar_pagamento_pix
 import base64
 from io import BytesIO
+from payment import gerar_pagamento_pix
+from database import init_db, salvar_assinatura, buscar_expirados, remover_assinatura
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
+ID_GRUPO = int(os.getenv("ID_GRUPO"))
 
 fastapi_app = FastAPI()
 pagamentos_pendentes = {}
 app = ApplicationBuilder().token(TOKEN).build()
+telegram_loop = None
 
+init_db()
+
+async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print(f"Chat ID: {update.message.chat_id}")
+    await update.message.reply_text(f"ID deste chat: `{update.message.chat_id}`", parse_mode="Markdown")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
@@ -58,9 +67,8 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         pagamento = gerar_pagamento_pix(query.data, user_id)
-        pagamentos_pendentes[str(pagamento["id"])] = chat_id
+        pagamentos_pendentes[str(pagamento["id"])] = (chat_id, query.data)
 
-        # Converte o base64 para imagem
         qr_image = BytesIO(base64.b64decode(pagamento["qr_code_base64"]))
         qr_image.name = "qrcode.png"
 
@@ -82,8 +90,30 @@ async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"Erro ao gerar pagamento: {e}")
 
 
-# Loop do Telegram para usar dentro do webhook
-telegram_loop = None
+async def verificar_assinaturas():
+    while True:
+        agora = datetime.now()
+        alvo = agora.replace(hour=22, minute=0, second=0, microsecond=0)
+        if agora >= alvo:
+            alvo = alvo.replace(day=alvo.day + 1)
+        segundos = (alvo - agora).total_seconds()
+        await asyncio.sleep(segundos)
+
+        expirados = buscar_expirados()
+        for chat_id in expirados:
+            try:
+                await app.bot.ban_chat_member(chat_id=ID_GRUPO, user_id=chat_id)
+                await app.bot.unban_chat_member(chat_id=ID_GRUPO, user_id=chat_id)
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "😔 Sua assinatura expirou e você foi removido do grupo.\n\n"
+                        "Para renovar e voltar ao reino, use /start 💗"
+                    )
+                )
+                remover_assinatura(chat_id)
+            except Exception as e:
+                print(f"Erro ao remover {chat_id}: {e}")
 
 
 @fastapi_app.post("/webhook")
@@ -102,14 +132,33 @@ async def webhook(request: Request):
         print(f"Status do pagamento: {payment.get('status')}")
 
         if payment["status"] == "approved":
-            chat_id = pagamentos_pendentes.get(payment_id)
-            print(f"Chat ID encontrado: {chat_id}")
-            if chat_id and telegram_loop:
+            pendente = pagamentos_pendentes.get(payment_id)
+            if pendente and telegram_loop:
+                chat_id, plano = pendente
+                print(f"Chat ID encontrado: {chat_id} | Plano: {plano}")
+
+                salvar_assinatura(chat_id, plano)
+
+                async def enviar_confirmacao(cid=chat_id, pid=plano):
+                    try:
+                        link = await app.bot.create_chat_invite_link(
+                            chat_id=ID_GRUPO,
+                            member_limit=1,
+                            name=f"user_{cid}"
+                        )
+                        await app.bot.send_message(
+                            chat_id=cid,
+                            text=(
+                                "✅ Pagamento confirmado! Seja bem-vindo ao reino 👑💗\n\n"
+                                f"Aqui está o seu link exclusivo para entrar no grupo:\n{link.invite_link}\n\n"
+                                "⚠️ Este link é único e expira após um uso, não compartilhe! 💗"
+                            ),
+                        )
+                    except Exception as e:
+                        print(f"Erro ao enviar confirmacao: {e}")
+
                 asyncio.run_coroutine_threadsafe(
-                    app.bot.send_message(
-                        chat_id=chat_id,
-                        text="✅ Pagamento confirmado! Seja bem-vindo ao reino 👑💗\n\nEm breve você receberá o acesso!",
-                    ),
+                    enviar_confirmacao(),
                     telegram_loop,
                 )
                 del pagamentos_pendentes[payment_id]
@@ -124,24 +173,22 @@ def rodar_fastapi():
 def main():
     global telegram_loop
 
-    # Inicia ngrok
     tunnel = ngrok.connect(8000)
     print(f"URL pública: {tunnel.public_url}/webhook")
     print("Cole essa URL no Mercado Pago em: Configurações > Notificações > Webhooks")
 
-    # Roda FastAPI em thread separada
     thread = threading.Thread(target=rodar_fastapi, daemon=True)
     thread.start()
 
-    # Pega o loop do Telegram
     telegram_loop = asyncio.new_event_loop()
     asyncio.set_event_loop(telegram_loop)
 
-    # Adiciona handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(responder))
+    app.add_handler(CommandHandler("getid", get_id))
 
-    # Roda o bot
+    telegram_loop.create_task(verificar_assinaturas())
+
     app.run_polling()
 
 
